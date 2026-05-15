@@ -1,0 +1,26 @@
+# Build outputs
+build/
+*.elf
+*.nro
+*.nacp
+*.nsp
+*.nso
+*.npdm
+
+# Intermediate / debug artifacts
+*.o
+*.d
+*.lst
+*.map
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Tooling
+compile_commands.json
+.cache/
+.claude/
