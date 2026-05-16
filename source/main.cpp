@@ -2,14 +2,16 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <switch.h>
 #include <SDL.h>
+#include <SDL_ttf.h>
 
 constexpr int MAX_PLAYERS = 6;
 constexpr int MIN_PLAYERS = 2;
 constexpr int START_LIFE  = 40;
 constexpr int WIN_W       = 1280;
 constexpr int WIN_H       = 720;
-constexpr Uint32 RESET_ARM_MS = 1500;
+constexpr Uint32 DELTA_WINDOW_MS = 5000;
 
 enum Screen   { SCREEN_SELECT, SCREEN_GAME };
 enum TileMode { MODE_LIFE, MODE_CMD };
@@ -18,6 +20,8 @@ struct Player {
     int      life;
     int      cmd_damage[MAX_PLAYERS];
     TileMode mode;
+    int      recent_delta;
+    Uint32   recent_delta_at;
 };
 
 struct Tile {
@@ -30,18 +34,17 @@ struct State {
     int    num_players;
     Player players[MAX_PLAYERS];
     Tile   tiles[MAX_PLAYERS];
-    bool   reset_armed;
-    Uint32 reset_armed_at;
+    bool   reset_confirm;
     bool   quit;
 };
 
 static const SDL_Color player_colors[MAX_PLAYERS] = {
     {220,  60,  60, 255}, // red
     { 70, 130, 230, 255}, // blue
-    { 60, 200,  90, 255}, // green
+    {240, 140,  40, 255}, // orange
     {230, 200,  50, 255}, // yellow
     {180,  90, 210, 255}, // purple
-    {240, 140,  40, 255}, // orange
+    {150,  95,  50, 255}, // brown
 };
 
 static int clampi(int v, int lo, int hi) {
@@ -54,11 +57,13 @@ static void reset_state(State &s) {
     for (int i = 0; i < MAX_PLAYERS; i++) {
         s.players[i].life = START_LIFE;
         s.players[i].mode = MODE_LIFE;
+        s.players[i].recent_delta = 0;
+        s.players[i].recent_delta_at = 0;
         for (int j = 0; j < MAX_PLAYERS; j++) {
             s.players[i].cmd_damage[j] = 0;
         }
     }
-    s.reset_armed = false;
+    s.reset_confirm = false;
 }
 
 static void layout_tiles(State &s, int W, int H) {
@@ -115,173 +120,110 @@ static bool screen_to_tile_local(const Tile &t, int sx, int sy, int &lx, int &ly
     return true;
 }
 
-// ---- 7-segment digit rendering ----
+// ---- TTF text rendering ----
 
-// segments: 0=a top, 1=b top-right, 2=c bottom-right, 3=d bottom,
-//           4=e bottom-left, 5=f top-left, 6=g middle
-static const bool digit_segs[10][7] = {
-    {1,1,1,1,1,1,0}, // 0
-    {0,1,1,0,0,0,0}, // 1
-    {1,1,0,1,1,0,1}, // 2
-    {1,1,1,1,0,0,1}, // 3
-    {0,1,1,0,0,1,1}, // 4
-    {1,0,1,1,0,1,1}, // 5
-    {1,0,1,1,1,1,1}, // 6
-    {1,1,1,0,0,0,0}, // 7
-    {1,1,1,1,1,1,1}, // 8
-    {1,1,1,1,0,1,1}, // 9
+static const char *FONT_PATH = "romfs:/font.ttf";
+
+// Small fixed set of pixel sizes the UI uses. Loaded once at startup.
+struct FontSlot { int size; TTF_Font *font; };
+static FontSlot g_fonts[8];
+static int g_font_count = 0;
+
+static TTF_Font *font_for_size(int size) {
+    if (size < 8) size = 8;
+    for (int i = 0; i < g_font_count; i++) {
+        if (g_fonts[i].size == size) return g_fonts[i].font;
+    }
+    if (g_font_count >= (int)(sizeof(g_fonts) / sizeof(g_fonts[0]))) {
+        // Reuse the largest slot rather than allocating unbounded sizes.
+        return g_fonts[0].font;
+    }
+    TTF_Font *f = TTF_OpenFont(FONT_PATH, size);
+    if (!f) {
+        SDL_Log("TTF_OpenFont(%d): %s", size, TTF_GetError());
+        return nullptr;
+    }
+    g_fonts[g_font_count++] = { size, f };
+    return f;
+}
+
+// LRU-ish text texture cache. Key includes string, size, and color.
+struct TextEntry {
+    char text[16];
+    int size;
+    Uint32 color_rgba;
+    SDL_Texture *tex;
+    int w, h;
+    Uint32 last_used;
 };
+constexpr int TEXT_CACHE_CAP = 96;
+static TextEntry g_text_cache[TEXT_CACHE_CAP];
+static int g_text_cache_count = 0;
+static Uint32 g_text_tick = 0;
 
-static SDL_Rect seg_rect(int seg, int W, int H, int t) {
-    SDL_Rect r = {0,0,0,0};
-    switch (seg) {
-        case 0: r = { 0,       0,            W, t };           break; // a
-        case 1: r = { W - t,   0,            t, H / 2 };       break; // b
-        case 2: r = { W - t,   H / 2,        t, H - H / 2 };   break; // c
-        case 3: r = { 0,       H - t,        W, t };           break; // d
-        case 4: r = { 0,       H / 2,        t, H - H / 2 };   break; // e
-        case 5: r = { 0,       0,            t, H / 2 };       break; // f
-        case 6: r = { 0,       H/2 - t/2,    W, t };           break; // g
-    }
-    return r;
+static Uint32 pack_color(SDL_Color c) {
+    return ((Uint32)c.r << 24) | ((Uint32)c.g << 16) | ((Uint32)c.b << 8) | (Uint32)c.a;
 }
 
-static void draw_digit(SDL_Renderer *r, int x, int y, int W, int H, int digit, bool flip, SDL_Color c) {
-    if (digit < 0 || digit > 9) return;
-    int t = W / 4;
-    if (t < 2) t = 2;
-    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
-    for (int s = 0; s < 7; s++) {
-        if (!digit_segs[digit][s]) continue;
-        SDL_Rect rect = seg_rect(s, W, H, t);
-        if (flip) {
-            rect.x = W - rect.x - rect.w;
-            rect.y = H - rect.y - rect.h;
-        }
-        rect.x += x;
-        rect.y += y;
-        SDL_RenderFillRect(r, &rect);
-    }
-}
-
-// ---- tiny 5x7 bitmap font (only glyphs we need) ----
-
-struct Glyph { char c; const char *rows[7]; };
-static const Glyph FONT[] = {
-    {' ', {"     ", "     ", "     ", "     ", "     ", "     ", "     "}},
-    {'?', {".XXX.", "X...X", "....X", "...X.", "..X..", ".....", "..X.."}},
-    {'A', {".XXX.", "X...X", "X...X", "XXXXX", "X...X", "X...X", "X...X"}},
-    {'E', {"XXXXX", "X....", "X....", "XXX..", "X....", "X....", "XXXXX"}},
-    {'H', {"X...X", "X...X", "X...X", "XXXXX", "X...X", "X...X", "X...X"}},
-    {'L', {"X....", "X....", "X....", "X....", "X....", "X....", "XXXXX"}},
-    {'M', {"X...X", "XX.XX", "X.X.X", "X.X.X", "X...X", "X...X", "X...X"}},
-    {'N', {"X...X", "XX..X", "X.X.X", "X..XX", "X...X", "X...X", "X...X"}},
-    {'O', {".XXX.", "X...X", "X...X", "X...X", "X...X", "X...X", ".XXX."}},
-    {'P', {"XXXX.", "X...X", "X...X", "XXXX.", "X....", "X....", "X...."}},
-    {'R', {"XXXX.", "X...X", "X...X", "XXXX.", "X.X..", "X..X.", "X...X"}},
-    {'S', {".XXXX", "X....", "X....", ".XXX.", "....X", "....X", "XXXX."}},
-    {'W', {"X...X", "X...X", "X...X", "X.X.X", "X.X.X", "XX.XX", "X...X"}},
-    {'Y', {"X...X", "X...X", ".X.X.", "..X..", "..X..", "..X..", "..X.."}},
-};
-
-static const Glyph *find_glyph(char c) {
-    for (size_t i = 0; i < sizeof(FONT) / sizeof(FONT[0]); i++) {
-        if (FONT[i].c == c) return &FONT[i];
-    }
-    return nullptr;
-}
-
-static int text_pixel_width(const char *s, int pix, int gap) {
-    int n = 0;
-    while (s[n]) n++;
-    if (n == 0) return 0;
-    return n * 5 * pix + (n - 1) * gap;
-}
-
-static void draw_text(SDL_Renderer *r, int x, int y, int pix, int gap, const char *s, SDL_Color col) {
-    SDL_SetRenderDrawColor(r, col.r, col.g, col.b, col.a);
-    while (*s) {
-        char c = *s;
-        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-        const Glyph *g = find_glyph(c);
-        if (g) {
-            for (int row = 0; row < 7; row++) {
-                for (int colp = 0; colp < 5; colp++) {
-                    if (g->rows[row][colp] == 'X') {
-                        SDL_Rect p = { x + colp * pix, y + row * pix, pix, pix };
-                        SDL_RenderFillRect(r, &p);
-                    }
-                }
-            }
-        }
-        x += 5 * pix + gap;
-        s++;
-    }
-}
-
-// Draws an 'X' inside (x, y, W, H) using two diagonals rasterized as 1px strokes.
-static void draw_letter_x(SDL_Renderer *r, int x, int y, int W, int H, SDL_Color c) {
-    int t = W / 6; if (t < 2) t = 2;
-    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
-    int span = (H < W ? H : W) - 1;
-    for (int i = 0; i <= span; i++) {
-        int px1 = x + (i * (W - t)) / span;
-        int py  = y + (i * (H - 1)) / span;
-        int px2 = x + W - t - (i * (W - t)) / span;
-        SDL_Rect a = { px1, py, t, 1 };
-        SDL_Rect b = { px2, py, t, 1 };
-        SDL_RenderFillRect(r, &a);
-        SDL_RenderFillRect(r, &b);
-    }
-}
-
-// Draws a capital 'R' inside (x, y, W, H). Not rotation-aware — used only on the
-// center reset button. Diagonal leg is rasterized as 1px-tall rect strokes.
-static void draw_letter_r(SDL_Renderer *r, int x, int y, int W, int H, SDL_Color c) {
-    int t = W / 5; if (t < 2) t = 2;
-    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
-
-    SDL_Rect left = { x, y, t, H };
-    SDL_RenderFillRect(r, &left);
-    SDL_Rect top = { x, y, W, t };
-    SDL_RenderFillRect(r, &top);
-    SDL_Rect tr = { x + W - t, y, t, H / 2 };
-    SDL_RenderFillRect(r, &tr);
-    SDL_Rect mid = { x, y + H/2 - t/2, W, t };
-    SDL_RenderFillRect(r, &mid);
-
-    // Diagonal leg from inner-left of the bowl down to bottom-right.
-    int sx = x + t;
-    int sy = y + H/2 + t/2;
-    int ex = x + W - t;
-    int ey = y + H - 1;
-    int dy = ey - sy;
-    int dx = ex - sx;
-    if (dy > 0) {
-        for (int i = 0; i <= dy; i++) {
-            int px = sx + (i * dx) / dy;
-            SDL_Rect stroke = { px, sy + i, t, 1 };
-            SDL_RenderFillRect(r, &stroke);
+static TextEntry *text_cache_get(SDL_Renderer *r, const char *text, int size, SDL_Color color) {
+    Uint32 key_color = pack_color(color);
+    for (int i = 0; i < g_text_cache_count; i++) {
+        TextEntry &e = g_text_cache[i];
+        if (e.size == size && e.color_rgba == key_color && strncmp(e.text, text, sizeof(e.text)) == 0) {
+            e.last_used = ++g_text_tick;
+            return &e;
         }
     }
+
+    TTF_Font *font = font_for_size(size);
+    if (!font) return nullptr;
+    SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, color);
+    if (!surf) return nullptr;
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(r, surf);
+    int w = surf->w, h = surf->h;
+    SDL_FreeSurface(surf);
+    if (!tex) return nullptr;
+
+    int slot;
+    if (g_text_cache_count < TEXT_CACHE_CAP) {
+        slot = g_text_cache_count++;
+    } else {
+        slot = 0;
+        for (int i = 1; i < TEXT_CACHE_CAP; i++) {
+            if (g_text_cache[i].last_used < g_text_cache[slot].last_used) slot = i;
+        }
+        if (g_text_cache[slot].tex) SDL_DestroyTexture(g_text_cache[slot].tex);
+    }
+    TextEntry &e = g_text_cache[slot];
+    strncpy(e.text, text, sizeof(e.text) - 1);
+    e.text[sizeof(e.text) - 1] = 0;
+    e.size = size;
+    e.color_rgba = key_color;
+    e.tex = tex;
+    e.w = w;
+    e.h = h;
+    e.last_used = ++g_text_tick;
+    return &e;
 }
 
-// Draws a 7-segment-style 'C' using segments a, d, e, f (same flip semantics as digits).
-static void draw_letter_c(SDL_Renderer *r, int x, int y, int W, int H, bool flip, SDL_Color c) {
-    int t = W / 4; if (t < 2) t = 2;
-    SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
-    const int segs[] = { 0, 3, 4, 5 }; // a, d, e, f
-    for (int i = 0; i < 4; i++) {
-        SDL_Rect rect = seg_rect(segs[i], W, H, t);
-        if (flip) {
-            rect.x = W - rect.x - rect.w;
-            rect.y = H - rect.y - rect.h;
-        }
-        rect.x += x;
-        rect.y += y;
-        SDL_RenderFillRect(r, &rect);
+static void text_cache_clear() {
+    for (int i = 0; i < g_text_cache_count; i++) {
+        if (g_text_cache[i].tex) SDL_DestroyTexture(g_text_cache[i].tex);
     }
+    g_text_cache_count = 0;
 }
+
+// Draws `text` centered at (cx, cy). When flip=true the texture is rotated 180°
+// so a player on the opposite side of the screen reads it right-side-up.
+static void draw_text_centered(SDL_Renderer *r, int cx, int cy, int size,
+                               const char *text, SDL_Color color, bool flip) {
+    TextEntry *e = text_cache_get(r, text, size, color);
+    if (!e) return;
+    SDL_Rect dst = { cx - e->w / 2, cy - e->h / 2, e->w, e->h };
+    SDL_RenderCopyEx(r, e->tex, nullptr, &dst, flip ? 180.0 : 0.0, nullptr, SDL_FLIP_NONE);
+}
+
+// ---- tap-zone hint primitives (kept as plain rects — these are icons, not text) ----
 
 static void draw_minus(SDL_Renderer *r, int x, int y, int W, int H, SDL_Color c) {
     int t = W / 4; if (t < 2) t = 2;
@@ -299,39 +241,6 @@ static void draw_plus(SDL_Renderer *r, int x, int y, int W, int H, SDL_Color c) 
     SDL_RenderFillRect(r, &v);
 }
 
-// Draws an integer centered at (cx, cy). When flip=true, the whole number reads
-// right-side-up to a viewer looking from the opposite side of the screen.
-static void draw_number(SDL_Renderer *r, int cx, int cy, int dW, int dH, int value, bool flip, SDL_Color c) {
-    char buf[8];
-    int v = value;
-    bool neg = v < 0;
-    if (neg) v = -v;
-    int n = snprintf(buf, sizeof(buf), "%d", v);
-    int spacing = dW / 5;
-    int sign_w  = neg ? (dW + spacing) : 0;
-    int total_w = n * dW + (n - 1) * spacing + sign_w;
-    int x = cx - total_w / 2;
-    int y = cy - dH / 2;
-    if (flip) {
-        for (int i = n - 1; i >= 0; i--) {
-            draw_digit(r, x, y, dW, dH, buf[i] - '0', true, c);
-            x += dW + spacing;
-        }
-        if (neg) {
-            draw_minus(r, x, y, dW, dH, c);
-        }
-    } else {
-        if (neg) {
-            draw_minus(r, x, y, dW, dH, c);
-            x += dW + spacing;
-        }
-        for (int i = 0; i < n; i++) {
-            draw_digit(r, x, y, dW, dH, buf[i] - '0', false, c);
-            x += dW + spacing;
-        }
-    }
-}
-
 // ---- layout constants inside a tile (local, unrotated coords) ----
 
 static SDL_Rect tile_cmd_btn_local(const Tile &t) {
@@ -346,20 +255,47 @@ static void fill_color(SDL_Renderer *r, SDL_Color c, Uint8 mult) {
 }
 
 static void draw_tile_life(SDL_Renderer *r, const Tile &t, const Player &p, SDL_Color color) {
-    fill_color(r, color, 70);
+    fill_color(r, color, 220);
     SDL_Rect bg = { t.x + 6, t.y + 6, t.w - 12, t.h - 12 };
     SDL_RenderFillRect(r, &bg);
 
-    int dW = t.h / 4;
-    if (dW > 140) dW = 140;
-    int dH = dW * 2;
+    int size = t.h / 2;
+    if (size > 240) size = 240;
+    if (size < 40) size = 40;
     int cx = t.x + t.w / 2;
     int cy = t.y + t.h / 2;
     SDL_Color white = {255, 255, 255, 255};
-    draw_number(r, cx, cy, dW, dH, clampi(p.life, -99, 999), t.rotated, white);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", clampi(p.life, -99, 999));
+    draw_text_centered(r, cx, cy, size, buf, white, t.rotated);
 
-    // Tap-zone hints: minus on local-left, plus on local-right (rotation handled
-    // by tile_to_screen).
+    // Underline below the number (in the player's reading direction) as an
+    // orientation cue.
+    int bar_w = size;
+    int bar_h = size / 24; if (bar_h < 3) bar_h = 3; if (bar_h > 6) bar_h = 6;
+    int bar_gap = 8;
+    int bar_off = size / 2 + bar_gap;
+    int bar_y = t.rotated ? (cy - bar_off - bar_h) : (cy + bar_off);
+    SDL_Rect bar = { cx - bar_w / 2, bar_y, bar_w, bar_h };
+    SDL_SetRenderDrawColor(r, 230, 230, 230, 255);
+    SDL_RenderFillRect(r, &bar);
+
+    Uint32 now = SDL_GetTicks();
+    if (p.recent_delta != 0 && (now - p.recent_delta_at) <= DELTA_WINDOW_MS) {
+        int dsize = size / 3;
+        if (dsize < 18) dsize = 18;
+        int dx_off = size / 2 + dsize;
+        char dbuf[8];
+        snprintf(dbuf, sizeof(dbuf), "%+d", p.recent_delta);
+        SDL_Color dcol = p.recent_delta > 0
+            ? SDL_Color{180, 240, 180, 255}
+            : SDL_Color{245, 180, 180, 255};
+        // Place above the main number in the player's reading direction.
+        int dcy = t.rotated ? (cy + dx_off) : (cy - dx_off);
+        draw_text_centered(r, cx, dcy, dsize, dbuf, dcol, t.rotated);
+    }
+
+    // Tap-zone hints: minus on local-left, plus on local-right.
     int ico = t.h / 8;
     if (ico < 32) ico = 32;
     if (ico > 64) ico = 64;
@@ -387,19 +323,31 @@ static void draw_tile_cmd(SDL_Renderer *r, const Tile &t, const Player &p, int s
         int y1 = ((oi + 1) * t.h) / opp_count;
         SDL_Rect local = { 4, y0 + 4, t.w - 8, (y1 - y0) - 8 };
         SDL_Rect screen = tile_to_screen(t, local);
-        fill_color(r, player_colors[i], 180);
+        fill_color(r, player_colors[i], 230);
         SDL_RenderFillRect(r, &screen);
 
-        int dH = local.h * 3 / 4;
-        int dW = dH / 2;
-        if (dW > 64) dW = 64;
-        if (dW < 14) dW = 14;
-        dH = dW * 2;
+        int size = local.h * 3 / 4;
+        if (size > 96) size = 96;
+        if (size < 20) size = 20;
         int cx = screen.x + screen.w / 2;
         int cy = screen.y + screen.h / 2;
         SDL_Color white = {255, 255, 255, 255};
         int dmg = clampi(p.cmd_damage[i], 0, 99);
-        draw_number(r, cx, cy, dW, dH, dmg, t.rotated, white);
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d", dmg);
+        draw_text_centered(r, cx, cy, size, buf, white, t.rotated);
+
+        int ico = local.h / 3;
+        if (ico < 16) ico = 16;
+        if (ico > 48) ico = 48;
+        int pad = ico / 2 + 8;
+        SDL_Color hint = {240, 240, 240, 255};
+        SDL_Rect minus_local = { local.x + pad, local.y + local.h/2 - ico/2, ico, ico };
+        SDL_Rect plus_local  = { local.x + local.w - pad - ico, local.y + local.h/2 - ico/2, ico, ico };
+        SDL_Rect minus_screen = tile_to_screen(t, minus_local);
+        SDL_Rect plus_screen  = tile_to_screen(t, plus_local);
+        draw_minus(r, minus_screen.x, minus_screen.y, ico, ico, hint);
+        draw_plus(r,  plus_screen.x,  plus_screen.y,  ico, ico, hint);
         oi++;
     }
 }
@@ -414,16 +362,11 @@ static void draw_cmd_toggle(SDL_Renderer *r, const Tile &t, bool active) {
     }
     SDL_RenderFillRect(r, &screen);
 
-    // 'C' glyph, centered inside the button, flipped on rotated tiles so it reads
-    // right-side-up to the player.
-    int gW = local.w / 2;
-    int gH = (gW * 3) / 2;
-    int glyph_lx = local.x + (local.w - gW) / 2;
-    int glyph_ly = local.y + (local.h - gH) / 2;
-    SDL_Rect glyph_local = { glyph_lx, glyph_ly, gW, gH };
-    SDL_Rect glyph_screen = tile_to_screen(t, glyph_local);
     SDL_Color fg = active ? SDL_Color{30, 30, 30, 255} : SDL_Color{230, 230, 230, 255};
-    draw_letter_c(r, glyph_screen.x, glyph_screen.y, gW, gH, t.rotated, fg);
+    int size = local.h * 3 / 4;
+    int cx = screen.x + screen.w / 2;
+    int cy = screen.y + screen.h / 2;
+    draw_text_centered(r, cx, cy, size, "C", fg, t.rotated);
 }
 
 // ---- reset button ----
@@ -434,23 +377,73 @@ static SDL_Rect reset_rect(int W, int H) {
     return { 24, 24, s, s };
 }
 
-static void draw_reset(SDL_Renderer *r, int W, int H, bool armed) {
+static void draw_reset(SDL_Renderer *r, int W, int H) {
     SDL_Rect rb = reset_rect(W, H);
-    if (armed) {
-        SDL_SetRenderDrawColor(r, 220, 60, 60, 255);
-    } else {
-        SDL_SetRenderDrawColor(r, 35, 35, 40, 255);
-    }
+    SDL_SetRenderDrawColor(r, 35, 35, 40, 255);
     SDL_RenderFillRect(r, &rb);
     SDL_SetRenderDrawColor(r, 230, 230, 230, 255);
     SDL_RenderDrawRect(r, &rb);
+    draw_text_centered(r, rb.x + rb.w / 2, rb.y + rb.h / 2, 44, "R",
+                       {220, 220, 220, 255}, false);
+}
 
-    SDL_Color fg = armed ? SDL_Color{255, 255, 255, 255} : SDL_Color{220, 220, 220, 255};
-    int gW = 28;
-    int gH = gW * 3 / 2;
-    int gx = rb.x + rb.w / 2 - gW / 2;
-    int gy = rb.y + rb.h / 2 - gH / 2;
-    draw_letter_r(r, gx, gy, gW, gH, fg);
+// ---- reset confirmation popup ----
+
+static SDL_Rect confirm_box_rect(int W, int H) {
+    int w = 560, h = 280;
+    return { (W - w) / 2, (H - h) / 2, w, h };
+}
+
+static SDL_Rect confirm_no_rect(int W, int H) {
+    SDL_Rect box = confirm_box_rect(W, H);
+    int bw = 200, bh = 80;
+    int gap = 40;
+    int y = box.y + box.h - bh - 32;
+    int x = box.x + box.w / 2 - bw - gap / 2;
+    return { x, y, bw, bh };
+}
+
+static SDL_Rect confirm_yes_rect(int W, int H) {
+    SDL_Rect box = confirm_box_rect(W, H);
+    int bw = 200, bh = 80;
+    int gap = 40;
+    int y = box.y + box.h - bh - 32;
+    int x = box.x + box.w / 2 + gap / 2;
+    return { x, y, bw, bh };
+}
+
+static void draw_reset_confirm(SDL_Renderer *r, int W, int H) {
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
+    SDL_Rect full = { 0, 0, W, H };
+    SDL_RenderFillRect(r, &full);
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+    SDL_Rect box = confirm_box_rect(W, H);
+    SDL_SetRenderDrawColor(r, 40, 40, 50, 255);
+    SDL_RenderFillRect(r, &box);
+    SDL_SetRenderDrawColor(r, 220, 220, 230, 255);
+    SDL_RenderDrawRect(r, &box);
+
+    draw_text_centered(r, box.x + box.w / 2, box.y + 80, 40,
+                       "Reset game?", {240, 240, 245, 255}, false);
+
+    SDL_Rect no_btn  = confirm_no_rect(W, H);
+    SDL_Rect yes_btn = confirm_yes_rect(W, H);
+
+    SDL_SetRenderDrawColor(r, 70, 70, 80, 255);
+    SDL_RenderFillRect(r, &no_btn);
+    SDL_SetRenderDrawColor(r, 200, 200, 210, 255);
+    SDL_RenderDrawRect(r, &no_btn);
+    draw_text_centered(r, no_btn.x + no_btn.w / 2, no_btn.y + no_btn.h / 2,
+                       36, "No", {240, 240, 245, 255}, false);
+
+    SDL_SetRenderDrawColor(r, 180, 50, 50, 255);
+    SDL_RenderFillRect(r, &yes_btn);
+    SDL_SetRenderDrawColor(r, 240, 200, 200, 255);
+    SDL_RenderDrawRect(r, &yes_btn);
+    draw_text_centered(r, yes_btn.x + yes_btn.w / 2, yes_btn.y + yes_btn.h / 2,
+                       36, "Yes", {255, 240, 240, 255}, false);
 }
 
 // ---- player select screen ----
@@ -479,17 +472,8 @@ static void draw_select_screen(SDL_Renderer *r, int W, int H) {
     SDL_SetRenderDrawColor(r, 60, 90, 140, 255);
     SDL_Rect title = { W/2 - 320, 80, 640, 60 };
     SDL_RenderFillRect(r, &title);
-
-    {
-        const char *prompt = "HOW MANY PLAYERS?";
-        int pix = 4;
-        int gap = pix;
-        int tw = text_pixel_width(prompt, pix, gap);
-        int th = 7 * pix;
-        int tx = title.x + (title.w - tw) / 2;
-        int ty = title.y + (title.h - th) / 2;
-        draw_text(r, tx, ty, pix, gap, prompt, {240, 240, 245, 255});
-    }
+    draw_text_centered(r, title.x + title.w / 2, title.y + title.h / 2, 36,
+                       "How many players?", {240, 240, 245, 255}, false);
 
     // Quit button (top-right)
     SDL_Rect qb = quit_rect(W, H);
@@ -497,12 +481,8 @@ static void draw_select_screen(SDL_Renderer *r, int W, int H) {
     SDL_RenderFillRect(r, &qb);
     SDL_SetRenderDrawColor(r, 230, 200, 200, 255);
     SDL_RenderDrawRect(r, &qb);
-    {
-        int inset = qb.w / 5;
-        draw_letter_x(r, qb.x + inset, qb.y + inset,
-                      qb.w - 2 * inset, qb.h - 2 * inset,
-                      {240, 240, 240, 255});
-    }
+    draw_text_centered(r, qb.x + qb.w / 2, qb.y + qb.h / 2, 52, "X",
+                       {240, 240, 240, 255}, false);
 
     SDL_Color white = {255, 255, 255, 255};
     for (int i = 0; i < 5; i++) {
@@ -513,11 +493,9 @@ static void draw_select_screen(SDL_Renderer *r, int W, int H) {
         SDL_SetRenderDrawColor(r, 200, 200, 210, 255);
         SDL_RenderDrawRect(r, &rb);
 
-        int dW = 70;
-        int dH = dW * 2;
-        int cx = rb.x + rb.w / 2 - dW / 2;
-        int cy = rb.y + rb.h / 2 - dH / 2;
-        draw_digit(r, cx, cy, dW, dH, n, false, white);
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%d", n);
+        draw_text_centered(r, rb.x + rb.w / 2, rb.y + rb.h / 2, 96, buf, white, false);
     }
 }
 
@@ -525,8 +503,19 @@ static void draw_select_screen(SDL_Renderer *r, int W, int H) {
 
 static void apply_life_tap(State &s, int idx, int lx) {
     Tile &t = s.tiles[idx];
+    Player &p = s.players[idx];
+    int old_life = p.life;
     int delta = (lx < t.w / 2) ? -1 : +1;
-    s.players[idx].life = clampi(s.players[idx].life + delta, -99, 999);
+    p.life = clampi(p.life + delta, -99, 999);
+    int actual = p.life - old_life;
+    if (actual == 0) return;
+
+    Uint32 now = SDL_GetTicks();
+    if (now - p.recent_delta_at > DELTA_WINDOW_MS) {
+        p.recent_delta = 0;
+    }
+    p.recent_delta += actual;
+    p.recent_delta_at = now;
 }
 
 static void apply_cmd_tap(State &s, int self_idx, int lx, int ly) {
@@ -545,10 +534,8 @@ static void apply_cmd_tap(State &s, int self_idx, int lx, int ly) {
     }
     if (source < 0) return;
     int delta = (lx < t.w / 2) ? -1 : +1;
-    int new_dmg = clampi(s.players[self_idx].cmd_damage[source] + delta, 0, 99);
-    int actual = new_dmg - s.players[self_idx].cmd_damage[source];
-    s.players[self_idx].cmd_damage[source] = new_dmg;
-    s.players[self_idx].life = clampi(s.players[self_idx].life - actual, -99, 999);
+    s.players[self_idx].cmd_damage[source] =
+        clampi(s.players[self_idx].cmd_damage[source] + delta, 0, 99);
 }
 
 static bool point_in(const SDL_Rect &r, int x, int y) {
@@ -574,24 +561,25 @@ static void handle_tap(State &s, int W, int H, int sx, int sy) {
         return;
     }
 
-    // Reset button (with arm-to-confirm)
-    SDL_Rect rb = reset_rect(W, H);
-    if (point_in(rb, sx, sy)) {
-        Uint32 now = SDL_GetTicks();
-        if (s.reset_armed && (now - s.reset_armed_at) <= RESET_ARM_MS) {
+    // Reset confirmation popup intercepts all taps when open.
+    if (s.reset_confirm) {
+        if (point_in(confirm_yes_rect(W, H), sx, sy)) {
             reset_state(s);
             s.screen = SCREEN_SELECT;
-        } else {
-            s.reset_armed = true;
-            s.reset_armed_at = now;
+            return;
+        }
+        if (point_in(confirm_no_rect(W, H), sx, sy)) {
+            s.reset_confirm = false;
         }
         return;
     }
-    // Tapping anywhere else cancels arm timer naturally via timeout, but we
-    // also clear it on any non-reset tap to avoid lingering red state.
-    s.reset_armed = false;
 
-    // Tile hit-test
+    SDL_Rect rb = reset_rect(W, H);
+    if (point_in(rb, sx, sy)) {
+        s.reset_confirm = true;
+        return;
+    }
+
     for (int i = 0; i < s.num_players; i++) {
         int lx, ly;
         if (!screen_to_tile_local(s.tiles[i], sx, sy, lx, ly)) continue;
@@ -625,9 +613,24 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    if (R_FAILED(romfsInit())) {
+        SDL_Log("romfsInit failed");
+        SDL_Quit();
+        return -1;
+    }
+
+    if (TTF_Init() < 0) {
+        SDL_Log("TTF_Init: %s\n", TTF_GetError());
+        romfsExit();
+        SDL_Quit();
+        return -1;
+    }
+
     window = SDL_CreateWindow("mtg-life-counter", 0, 0, WIN_W, WIN_H, 0);
     if (!window) {
         SDL_Log("SDL_CreateWindow: %s\n", SDL_GetError());
+        TTF_Quit();
+        romfsExit();
         SDL_Quit();
         return -1;
     }
@@ -636,11 +639,12 @@ int main(int argc, char *argv[])
     if (!renderer) {
         SDL_Log("SDL_CreateRenderer: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);
+        TTF_Quit();
+        romfsExit();
         SDL_Quit();
         return -1;
     }
 
-    // Keep joystick #0 open only so the (+) button can quit cleanly.
     SDL_JoystickOpen(0);
 
     State state{};
@@ -662,7 +666,6 @@ int main(int argc, char *argv[])
                 } break;
 
                 case SDL_MOUSEBUTTONDOWN: {
-                    // SDL on Switch may also surface touch as mouse events; handle for safety.
                     if (event.button.button == SDL_BUTTON_LEFT) {
                         handle_tap(state, W, H, event.button.x, event.button.y);
                     }
@@ -670,8 +673,13 @@ int main(int argc, char *argv[])
 
                 case SDL_JOYBUTTONDOWN:
                     if (event.jbutton.which == 0 && event.jbutton.button == 10) {
-                        // (+) quits
-                        done = 1;
+                        // (+) opens the reset modal in-game; on the select
+                        // screen it still quits since there's nothing to reset.
+                        if (state.screen == SCREEN_GAME) {
+                            state.reset_confirm = !state.reset_confirm;
+                        } else {
+                            done = 1;
+                        }
                     }
                     break;
 
@@ -688,13 +696,6 @@ int main(int argc, char *argv[])
             done = 1;
         }
 
-        // Clear arm flag if timer elapsed
-        if (state.reset_armed &&
-            (SDL_GetTicks() - state.reset_armed_at) > RESET_ARM_MS) {
-            state.reset_armed = false;
-        }
-
-        // Background
         SDL_SetRenderDrawColor(renderer, 10, 10, 12, 255);
         SDL_RenderClear(renderer);
 
@@ -711,14 +712,23 @@ int main(int argc, char *argv[])
                 }
                 draw_cmd_toggle(renderer, t, state.players[i].mode == MODE_CMD);
             }
-            draw_reset(renderer, W, H, state.reset_armed);
+            draw_reset(renderer, W, H);
+            if (state.reset_confirm) {
+                draw_reset_confirm(renderer, W, H);
+            }
         }
 
         SDL_RenderPresent(renderer);
     }
 
+    text_cache_clear();
+    for (int i = 0; i < g_font_count; i++) TTF_CloseFont(g_fonts[i].font);
+    g_font_count = 0;
+
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    TTF_Quit();
+    romfsExit();
     SDL_Quit();
     return 0;
 }
