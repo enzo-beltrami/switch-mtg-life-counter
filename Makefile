@@ -44,6 +44,10 @@ DATA		:=	data
 INCLUDES	:=	include
 ROMFS	:=	romfs
 
+APP_TITLE	:=	MTG Life Counter
+APP_AUTHOR	:=	Enzo Beltrami
+APP_VERSION	:=	1.0.0
+
 #---------------------------------------------------------------------------------
 # options for code generation
 #---------------------------------------------------------------------------------
