@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SDL2 + SDL2_ttf portlibs
+        run: |
+          pacman -S --noconfirm switch-sdl2 switch-sdl2_ttf
+
+      - name: Build
+        run: make
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mtg-life-counter.nro
+          generate_release_notes: true
+          fail_on_unmatched_files: true
