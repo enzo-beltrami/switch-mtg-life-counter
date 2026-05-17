@@ -7,8 +7,6 @@
 A touch-only Commander life counter for the Nintendo Switch, built with SDL2 and
 devkitPro. Made for handheld / tabletop mode — controller input is ignored.
 
-This was heavely vibe-coded because i had this idea 1 hour before a mtg session
-
 ## Features
 
 - Player-select screen for 2–6 players
