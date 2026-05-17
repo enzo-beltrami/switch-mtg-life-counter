@@ -17,7 +17,7 @@ jobs:
 
       - name: Install SDL2 + SDL2_ttf portlibs
         run: |
-          pacman -S --noconfirm switch-sdl2 switch-sdl2_ttf
+          dkp-pacman -S --noconfirm switch-sdl2 switch-sdl2_ttf
 
       - name: Build
         run: make
