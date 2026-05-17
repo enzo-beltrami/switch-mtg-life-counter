@@ -53,6 +53,8 @@ int main(int argc, char *argv[])
 
     SDL_JoystickOpen(0);
 
+    appletSetMediaPlaybackState(true);
+
     State state{};
     state.screen = SCREEN_SELECT;
     state.num_players = 4;
@@ -128,6 +130,8 @@ int main(int argc, char *argv[])
     }
 
     text_shutdown();
+
+    appletSetMediaPlaybackState(false);
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
